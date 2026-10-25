@@ -18,7 +18,7 @@ permissions:
 env:
   SDK_REF: ${{ github.event.inputs.sdk_ref || 'v0.9.0' }}
   # Bump when patches/ changes; the package is published as <SDK_REF>-<PATCH_LEVEL>.
-  PATCH_LEVEL: p4
+  PATCH_LEVEL: p5
 
 jobs:
   windows:
@@ -57,9 +57,14 @@ jobs:
         shell: pwsh
         working-directory: rexglue-sdk
         run: |
+          # *.ffmpeg.patch apply inside the thirdparty/FFmpeg submodule, the rest at the SDK root.
           Get-ChildItem ..\builds\patches\*.patch | Sort-Object Name | ForEach-Object {
             Write-Host "Applying $($_.Name)"
-            git apply --ignore-whitespace --whitespace=nowarn $_.FullName
+            if ($_.Name -like '*.ffmpeg.patch') {
+              git -C thirdparty/FFmpeg apply --ignore-whitespace --whitespace=nowarn $_.FullName
+            } else {
+              git apply --ignore-whitespace --whitespace=nowarn $_.FullName
+            }
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
