@@ -36,6 +36,10 @@ jobs:
         with:
           arch: x64
 
+      - name: Keep LF line endings (patches are LF)
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Checkout patches
         uses: actions/checkout@v4
         with:
@@ -55,7 +59,7 @@ jobs:
         run: |
           Get-ChildItem ..\builds\patches\*.patch | Sort-Object Name | ForEach-Object {
             Write-Host "Applying $($_.Name)"
-            git apply --whitespace=nowarn $_.FullName
+            git apply --ignore-whitespace --whitespace=nowarn $_.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
