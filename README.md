@@ -4,7 +4,13 @@ Prebuilt [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) packages for the 
 
 | Release | Asset |
 |---|---|
-| `sdk-v0.9.0` | `rexglue-sdk-v0.9.0-win-amd64-release.zip` (Windows x64, Release, clang, Tracy off) |
+| `sdk-v0.9.0` | `rexglue-sdk-v0.9.0-win-amd64-release.zip` - stock v0.9.0 (Windows x64, Release, clang, Tracy off) |
+| `sdk-v0.9.0-p1` | `rexglue-sdk-v0.9.0-p1-win-amd64-release.zip` - v0.9.0 + `patches/0001` (XMA decoder fixes) |
+
+## Patches
+`patches/*.patch` are applied in name order on top of the upstream tag. Bump `PATCH_LEVEL` in the workflow when they change.
+
+- `0001-xma-port-canary-decoder-fixes.patch` - ports four xenia-canary XMA fixes (aee0871 split frame header counted, 6bef1fb drain partial frame, 7015473 sub-stream skip chain, 2372a54 sample rounding). Fixes periodic clicks in OutRun Online Arcade.
 
 To build another SDK version: **Actions → Build ReXGlue SDK → Run workflow**, enter the tag.
 

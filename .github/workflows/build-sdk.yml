@@ -10,13 +10,15 @@ on:
         default: "v0.9.0"
   push:
     branches: [main]
-    paths: [".github/workflows/build-sdk.yml"]
+    paths: [".github/workflows/build-sdk.yml", "patches/**"]
 
 permissions:
   contents: write
 
 env:
   SDK_REF: ${{ github.event.inputs.sdk_ref || 'v0.9.0' }}
+  # Bump when patches/ changes; the package is published as <SDK_REF>-<PATCH_LEVEL>.
+  PATCH_LEVEL: p1
 
 jobs:
   windows:
@@ -34,6 +36,11 @@ jobs:
         with:
           arch: x64
 
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: builds
+
       - name: Checkout ReXGlue SDK
         uses: actions/checkout@v4
         with:
@@ -41,6 +48,16 @@ jobs:
           ref: ${{ env.SDK_REF }}
           path: rexglue-sdk
           submodules: recursive
+
+      - name: Apply patches
+        shell: pwsh
+        working-directory: rexglue-sdk
+        run: |
+          Get-ChildItem ..\builds\patches\*.patch | Sort-Object Name | ForEach-Object {
+            Write-Host "Applying $($_.Name)"
+            git apply --whitespace=nowarn $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Build and install SDK
         shell: pwsh
@@ -57,14 +74,17 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $name = "rexglue-sdk-$env:SDK_REF-win-amd64-release.zip"
+          $pkg = "$env:SDK_REF-$env:PATCH_LEVEL"
+          $name = "rexglue-sdk-$pkg-win-amd64-release.zip"
           @"
-          ReXGlue SDK $env:SDK_REF - Windows x64, Release, clang (Tracy off)
+          ReXGlue SDK $pkg - Windows x64, Release, clang (Tracy off)
           Built from https://github.com/rexglue/rexglue-sdk at $env:SDK_REF
+          plus patches: $((Get-ChildItem builds\patches\*.patch | ForEach-Object Name) -join ', ')
           Licenses: see share/licenses and the SDK's LICENSE (BSD-3-Clause, portions Xenia BSD).
           "@ | Out-File sdk\BUILD_INFO.txt -Encoding utf8
           Compress-Archive -Path sdk\* -DestinationPath $name
           "ASSET=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PKG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append
           Get-Item $name
 
       - name: Publish release
@@ -72,10 +92,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "sdk-$env:SDK_REF"
+          $tag = "sdk-$env:PKG"
           gh release view $tag -R $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag -R $env:GITHUB_REPOSITORY --title "ReXGlue SDK $env:SDK_REF (win-amd64)" `
-              --notes "Prebuilt ReXGlue SDK $env:SDK_REF for the darkuni Xbox 360 recomp repos. Contains no game code."
+            gh release create $tag -R $env:GITHUB_REPOSITORY --title "ReXGlue SDK $env:PKG (win-amd64)" `
+              --notes "Prebuilt ReXGlue SDK $env:SDK_REF + patches/ ($env:PATCH_LEVEL) for the darkuni Xbox 360 recomp repos. Contains no game code."
           }
           gh release upload $tag $env:ASSET -R $env:GITHUB_REPOSITORY --clobber
