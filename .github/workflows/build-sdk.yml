@@ -1,0 +1,81 @@
+name: Build ReXGlue SDK
+
+# Builds the ReXGlue SDK once and publishes it as a release asset, so every
+# game recomp repo can download it instead of compiling it (~25 min saved).
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_ref:
+        description: "rexglue-sdk tag or commit to build"
+        default: "v0.9.0"
+  push:
+    branches: [main]
+    paths: [".github/workflows/build-sdk.yml"]
+
+permissions:
+  contents: write
+
+env:
+  SDK_REF: ${{ github.event.inputs.sdk_ref || 'v0.9.0' }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Install LLVM (clang 20+) and Ninja
+        shell: pwsh
+        run: |
+          choco install llvm ninja -y --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: MSVC environment (headers/libs for clang)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Checkout ReXGlue SDK
+        uses: actions/checkout@v4
+        with:
+          repository: rexglue/rexglue-sdk
+          ref: ${{ env.SDK_REF }}
+          path: rexglue-sdk
+          submodules: recursive
+
+      - name: Build and install SDK
+        shell: pwsh
+        working-directory: rexglue-sdk
+        run: |
+          clang++ --version
+          cmake --preset win-amd64 `
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
+            -DREXGLUE_ENABLE_TRACY=OFF `
+            "-DCMAKE_INSTALL_PREFIX=$env:GITHUB_WORKSPACE/sdk"
+          cmake --build out/build/win-amd64 --config Release --target install --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "rexglue-sdk-$env:SDK_REF-win-amd64-release.zip"
+          @"
+          ReXGlue SDK $env:SDK_REF - Windows x64, Release, clang (Tracy off)
+          Built from https://github.com/rexglue/rexglue-sdk at $env:SDK_REF
+          Licenses: see share/licenses and the SDK's LICENSE (BSD-3-Clause, portions Xenia BSD).
+          "@ | Out-File sdk\BUILD_INFO.txt -Encoding utf8
+          Compress-Archive -Path sdk\* -DestinationPath $name
+          "ASSET=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-Item $name
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "sdk-$env:SDK_REF"
+          gh release view $tag -R $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag -R $env:GITHUB_REPOSITORY --title "ReXGlue SDK $env:SDK_REF (win-amd64)" `
+              --notes "Prebuilt ReXGlue SDK $env:SDK_REF for the darkuni Xbox 360 recomp repos. Contains no game code."
+          }
+          gh release upload $tag $env:ASSET -R $env:GITHUB_REPOSITORY --clobber
