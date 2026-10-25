@@ -1,5 +1,34 @@
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index ab387be..0be0b82 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -245,6 +245,7 @@ class XmaContext {
+   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
+   void ClearLocked(XMA_CONTEXT_DATA* data);
+   void ResetDecoderState();
++  void FlushCarry();
+ 
+   memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
+   int PrepareDecoder(int sample_rate, bool is_two_channel);
+@@ -285,6 +286,16 @@ class XmaContext {
+   // Loop subframe precision state
+   uint8_t loop_frame_output_limit_ = 0;
+   bool loop_start_skip_pending_ = false;
++
++  // Sample-accurate output packing. The hardware drops the stream start/end
++  // skip samples exactly, so a looped (re-submitted) wave joins seamlessly.
++  // Output is written in 256-byte blocks, so samples that do not fill a whole
++  // block are carried over and prepended to the next frame.
++  std::array<uint8_t, kBytesPerFrameChannel * 2 + kOutputBytesPerBlock> out_frame_;
++  std::array<uint8_t, kOutputBytesPerBlock> carry_;
++  uint32_t carry_bytes_ = 0;
++  bool carry_stereo_ = false;
++  uint8_t current_frame_total_subframes_ = 0;
+ };
+ 
+ }  // namespace rex::audio
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..3827abd 100644
+index d36dc6f..037902b 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -15,6 +15,9 @@
@@ -75,7 +104,41 @@ index d36dc6f..3827abd 100644
    if (!data.output_buffer_valid) {
      return true;
    }
-@@ -239,6 +282,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -134,6 +177,9 @@ bool XmaContext::Work() {
+ 
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+     Decode(&data);
++    if (!data.IsAnyInputBufferValid()) {
++      FlushCarry();  // end of stream: emit the last partial block
++    }
+     Consume(&output_rb, &data);
+ 
+     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+@@ -200,6 +246,23 @@ void XmaContext::ResetDecoderState() {
+   current_frame_remaining_subframes_ = 0;
+   loop_frame_output_limit_ = 0;
+   loop_start_skip_pending_ = false;
++  carry_bytes_ = 0;
++  current_frame_total_subframes_ = 0;
++}
++
++void XmaContext::FlushCarry() {
++  if (!carry_bytes_) {
++    return;
++  }
++  if (!current_frame_remaining_subframes_) {
++    current_frame_total_subframes_ = 0;
++  }
++  uint8_t* dst = out_frame_.data() + current_frame_total_subframes_ * kOutputBytesPerBlock;
++  std::memcpy(dst, carry_.data(), carry_bytes_);
++  std::memset(dst + carry_bytes_, 0, kOutputBytesPerBlock - carry_bytes_);
++  current_frame_total_subframes_++;
++  current_frame_remaining_subframes_++;
++  carry_bytes_ = 0;
+ }
+ 
+ void XmaContext::Disable() {
+@@ -239,6 +302,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
      return;
    }
  
@@ -86,7 +149,20 @@ index d36dc6f..3827abd 100644
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
  
-@@ -614,6 +661,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -445,10 +512,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+   }
+ 
+   const int8_t raw_frame_read_offset =
+-      ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
+-      current_frame_remaining_subframes_;
++      current_frame_total_subframes_ - current_frame_remaining_subframes_;
+ 
+-  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
++  output_rb->Write(out_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+                    subframes_to_write * kOutputBytesPerBlock);
+ 
+   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
+@@ -614,6 +680,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
    }
  
@@ -103,23 +179,42 @@ index d36dc6f..3827abd 100644
    BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
    stream.SetOffset(data->input_buffer_read_offset);
  
-@@ -668,10 +725,47 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -656,23 +732,68 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   if (DecodePacket(av_context_, av_packet_, av_frame_)) {
+     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
+                  raw_frame_.data());
+-    current_frame_remaining_subframes_ = 4 << data->is_stereo;
++    // Work out which samples of this frame are audible, in samples per
++    // channel: [s0, s1).
++    uint32_t s0 = 0;
++    uint32_t s1 = kSamplesPerFrame;
+ 
+-    // Loop end: limit output to subframes 0..loop_subframe_end.
++    // Loop end: output subframes 0..loop_subframe_end.
+     if (is_loop_end_frame) {
+-      loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
+-    } else {
+-      loop_frame_output_limit_ = 0;
++      s1 = std::min<uint32_t>(kSamplesPerFrame,
++                              (data->loop_subframe_end + 1) * kSamplesPerSubframe);
+     }
+ 
      // Loop start: skip leading subframes per loop_subframe_skip. skip == 4
      // means the whole frame is a warm-up frame (frame-aligned loop start):
      // decode seeds the codec state, output is fully discarded.
 +    bool skipped_for_loop = false;
      if (loop_start_skip_pending_) {
-       const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
-       current_frame_remaining_subframes_ -= std::min(skip, current_frame_remaining_subframes_);
+-      const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
+-      current_frame_remaining_subframes_ -= std::min(skip, current_frame_remaining_subframes_);
++      s0 = std::min<uint32_t>(kSamplesPerFrame, data->loop_subframe_skip * kSamplesPerSubframe);
        loop_start_skip_pending_ = false;
 +      skipped_for_loop = true;
 +    }
 +
 +    // Stream start/end skip carried in the frame header (encoder delay at the
-+    // start of a stream, padding at its end). The XMA hardware drops these
-+    // samples; FFmpeg only reports them. Output granularity is a 128-sample
-+    // subframe, so round the start skip down and the end skip down as well
-+    // (never drop audible samples).
++    // start of a stream, padding at its end). The XMA hardware drops exactly
++    // these samples; FFmpeg only reports them. Games that loop a sound by
++    // re-submitting the same buffer rely on this for a seamless join.
 +    if (REXCVAR_GET(xma_honor_stream_skip)) {
 +      const AVDictionaryEntry* start_e = av_dict_get(av_frame_->metadata, "xma_start_skip", nullptr, 0);
 +      const AVDictionaryEntry* end_e = av_dict_get(av_frame_->metadata, "xma_end_skip", nullptr, 0);
@@ -129,25 +224,34 @@ index d36dc6f..3827abd 100644
 +        REXAPU_INFO("[xma] ctx {} frame skip start={} end={} at rd={}", id(), start_skip, end_skip,
 +                    uint32_t(data->input_buffer_read_offset));
 +      }
-+      const uint8_t per_ch = static_cast<uint8_t>(kSamplesPerFrame / kSamplesPerSubframe);  // 4
 +      if (end_skip > 0 && !is_loop_end_frame) {
-+        const uint8_t keep =
-+            static_cast<uint8_t>(per_ch - std::min<int>(per_ch, end_skip / kSamplesPerSubframe));
-+        const uint8_t limit = static_cast<uint8_t>(keep << data->is_stereo);
-+        if (limit < current_frame_remaining_subframes_) {
-+          // Reuse the loop-end limiter: output only the first `limit` subframes.
-+          loop_frame_output_limit_ = limit ? limit : 0;
-+          if (!limit) {
-+            current_frame_remaining_subframes_ = 0;
-+          }
-+        }
++        s1 = std::min<uint32_t>(s1, kSamplesPerFrame - std::min<uint32_t>(kSamplesPerFrame, end_skip));
 +      }
 +      if (start_skip > 0 && !skipped_for_loop) {
-+        const uint8_t skip =
-+            static_cast<uint8_t>(std::min<int>(per_ch, start_skip / kSamplesPerSubframe)
-+                                 << data->is_stereo);
-+        current_frame_remaining_subframes_ -= std::min(skip, current_frame_remaining_subframes_);
++        s0 = std::max<uint32_t>(s0, std::min<uint32_t>(kSamplesPerFrame, start_skip));
 +      }
++    }
++    if (s0 > s1) {
++      s0 = s1;
++    }
++
++    // Pack carry + [s0, s1) into whole output blocks; keep the remainder.
++    const uint32_t frame_bytes = kBytesPerSample << data->is_stereo;  // one sample, all channels
++    if (carry_stereo_ != bool(data->is_stereo)) {
++      carry_bytes_ = 0;
      }
++    const uint32_t body = (s1 - s0) * frame_bytes;
++    std::memcpy(out_frame_.data(), carry_.data(), carry_bytes_);
++    std::memcpy(out_frame_.data() + carry_bytes_, raw_frame_.data() + s0 * frame_bytes, body);
++    const uint32_t total = carry_bytes_ + body;
++    const uint32_t blocks = total / kOutputBytesPerBlock;
++    carry_bytes_ = total % kOutputBytesPerBlock;
++    std::memcpy(carry_.data(), out_frame_.data() + blocks * kOutputBytesPerBlock, carry_bytes_);
++    carry_stereo_ = bool(data->is_stereo);
++
++    current_frame_total_subframes_ = static_cast<uint8_t>(blocks);
++    current_frame_remaining_subframes_ = static_cast<uint8_t>(blocks);
++    loop_frame_output_limit_ = 0;
    }
  
+   // Compute where to go next.
