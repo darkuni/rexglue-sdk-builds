@@ -7,12 +7,15 @@ Prebuilt [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) packages for the 
 | `sdk-v0.9.0` | `rexglue-sdk-v0.9.0-win-amd64-release.zip` - stock v0.9.0 (Windows x64, Release, clang, Tracy off) |
 | `sdk-v0.9.0-p1` | `rexglue-sdk-v0.9.0-p1-win-amd64-release.zip` - v0.9.0 + `patches/0001` |
 | `sdk-v0.9.0-p2` | `rexglue-sdk-v0.9.0-p2-win-amd64-release.zip` - v0.9.0 + earlier XMA patches (superseded) |
-| `sdk-v0.9.0-p3` | `rexglue-sdk-v0.9.0-p3-win-amd64-release.zip` - v0.9.0 + XMA decoder from xenia-canary |
+| `sdk-v0.9.0-p3` | `rexglue-sdk-v0.9.0-p3-win-amd64-release.zip` - v0.9.0 + XMA decoder from xenia-canary (didn't help; archived) |
+| `sdk-v0.9.0-p4` | `rexglue-sdk-v0.9.0-p4-win-amd64-release.zip` - stock v0.9.0 decoder + `xma_trace` diagnostics only |
 
 ## Patches
-`patches/*.patch` are applied in name order on top of the upstream tag. Bump `PATCH_LEVEL` in the workflow when they change.
+`patches/*.patch` are applied in name order on top of the upstream tag (`patches/archive/` is not applied). Bump `PATCH_LEVEL` in the workflow when they change.
 
-- `0001-xma-decoder-from-xenia-canary-451f915.patch` - replaces the XMA decode path (Work, Decode, Consume, packet/frame walking, buffer swap, loop handling, output ring setup, context write-back) with xenia-canary's `xma_context_new.cc` at commit 451f915 (2026-10-24), adapted to ReXGlue. Matches Xenia in never flushing the FFmpeg decoder on context clear/release; `xma_flush_decoder_on_release=true` restores the SDK's flush on release. Supersedes the p1/p2 patches (their fixes are included). Target: periodic clicking in OutRun Online Arcade races.
+- `0001-xma-trace-loop-config.patch` - diagnostics only, no behaviour change. `xma_trace=true` logs each XMA context's buffers and loop registers when they change, every loop jump taken, and any loop_end that falls inside a frame (a loop the decoder will miss).
+
+Archived: the xenia-canary decoder swap (p3) and the p1/p2 fixes did not change OutRun's race clicking. An offline harness running the stock decoder on OutRun's engine loop (`ICS_116`) showed the clip loops seamlessly via the loop registers (loop_start=32, loop_end=39729, subframe_end=3, skip=4) but gains a silent padding frame per pass when replayed without them.
 
 To build another SDK version: **Actions → Build ReXGlue SDK → Run workflow**, enter the tag.
 

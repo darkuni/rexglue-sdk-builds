@@ -1,0 +1,92 @@
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index d36dc6f..1ff2e69 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -15,6 +15,9 @@
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/audio/xma/helpers.h>
++#include <rex/cvar.h>
++
++#include <array>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/memory/ring_buffer.h>
+@@ -36,8 +39,20 @@ extern "C" {
+ // Credits for most of this code goes to:
+ // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+ 
++REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio",
++                    "Log XMA context setup (buffers, loop registers) when it changes, and loop-end "
++                    "positions the decoder steps over without looping (diagnostics only)");
++
+ namespace rex::audio {
+ 
++namespace {
++struct TraceState {
++  uint32_t sig[10] = {};
++  bool valid = false;
++};
++std::array<TraceState, 320> g_xma_trace_state;
++}  // namespace
++
+ using stream::BitStream;
+ 
+ const uint32_t XmaContext::kBitsPerPacketHeader;
+@@ -104,6 +119,28 @@ bool XmaContext::Work() {
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
+ 
++  if (REXCVAR_GET(xma_trace) && id() < g_xma_trace_state.size()) {
++    const uint32_t sig[10] = {uint32_t(data.loop_count),        uint32_t(data.loop_start),
++                              uint32_t(data.loop_end),          uint32_t(data.loop_subframe_end),
++                              uint32_t(data.loop_subframe_skip), uint32_t(data.input_buffer_0_ptr),
++                              uint32_t(data.input_buffer_0_packet_count),
++                              uint32_t(data.input_buffer_1_ptr),
++                              uint32_t(data.input_buffer_1_packet_count),
++                              uint32_t(data.sample_rate)};
++    auto& st = g_xma_trace_state[id()];
++    if (!st.valid || std::memcmp(st.sig, sig, sizeof(sig)) != 0) {
++      std::memcpy(st.sig, sig, sizeof(sig));
++      st.valid = true;
++      REXAPU_INFO(
++          "[xma] ctx {} cfg loop_count={} loop_start={} loop_end={} sf_end={} sf_skip={} "
++          "in0={:08X}x{} in1={:08X}x{} rate={} stereo={} rd={} v0={} v1={} cur={} sdc={}",
++          id(), sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], sig[6], sig[7], sig[8], sig[9],
++          uint32_t(data.is_stereo), uint32_t(data.input_buffer_read_offset),
++          uint32_t(data.input_buffer_0_valid), uint32_t(data.input_buffer_1_valid),
++          uint32_t(data.current_buffer), uint32_t(data.subframe_decode_count));
++    }
++  }
++
+   if (!data.output_buffer_valid) {
+     return true;
+   }
+@@ -239,6 +276,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+     return;
+   }
+ 
++  if (REXCVAR_GET(xma_trace)) {
++    REXAPU_INFO("[xma] ctx {} loop jump {} -> {} (count={})", id(), loop_end, loop_start,
++                uint32_t(data->loop_count));
++  }
+   data->input_buffer_read_offset = loop_start;
+   loop_start_skip_pending_ = true;
+ 
+@@ -614,6 +655,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
+   }
+ 
++  if (REXCVAR_GET(xma_trace) && data->loop_count > 0 && !is_loop_end_frame) {
++    const uint32_t frame_start = data->input_buffer_read_offset;
++    const uint32_t frame_end = frame_start + packet_info.current_frame_size_;
++    if (data->loop_end > frame_start && data->loop_end < frame_end) {
++      REXAPU_INFO("[xma] ctx {} loop_end {} falls INSIDE frame {}..{} (not on a frame start) - "
++                  "loop will be missed",
++                  id(), uint32_t(data->loop_end), frame_start, frame_end);
++    }
++  }
++
+   BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
+   stream.SetOffset(data->input_buffer_read_offset);
+ 
