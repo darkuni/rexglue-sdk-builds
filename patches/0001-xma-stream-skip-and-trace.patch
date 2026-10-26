@@ -31,10 +31,10 @@ index ab387be..833d352 100644
  
  }  // namespace rex::audio
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..8837365 100644
+index d36dc6f..8079ed4 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
-@@ -15,6 +15,10 @@
+@@ -15,6 +15,12 @@
  #include <rex/audio/xma/context.h>
  #include <rex/audio/xma/decoder.h>
  #include <rex/audio/xma/helpers.h>
@@ -42,10 +42,12 @@ index d36dc6f..8837365 100644
 +
 +#include <array>
 +#include <chrono>
++#include <cstdio>
++#include <filesystem>
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/memory/ring_buffer.h>
-@@ -27,6 +31,7 @@ extern "C" {
+@@ -27,6 +33,7 @@ extern "C" {
  #pragma warning(disable : 4101 4244 5033)
  #endif
  #include "libavcodec/avcodec.h"
@@ -53,7 +55,7 @@ index d36dc6f..8837365 100644
  #include "libavutil/error.h"
  #if REX_COMPILER_MSVC
  #pragma warning(pop)
-@@ -36,8 +41,35 @@ extern "C" {
+@@ -36,8 +43,72 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -65,6 +67,15 @@ index d36dc6f..8837365 100644
 +                    "Drop the encoder-delay / end-padding samples marked in XMA frame headers "
 +                    "(start/end skip), as the console's XMA hardware does. Fixes the click at "
 +                    "every pass of buffer-resubmitted loops (e.g. OutRun's engine sounds).");
++
++REXCVAR_DEFINE_INT32(xma_skip_mode, 1, "Audio",
++                     "How stream start/end skips are applied (needs xma_honor_stream_skip): "
++                     "1 = on raw decoder output, 2 = corrected for FFmpeg's 64-sample decoder "
++                     "delay and the final IMDCT subframe (vgmstream accounting)");
++
++REXCVAR_DEFINE_BOOL(xma_dump, false, "Audio",
++                    "Write every XMA context's decoded output to xma_dump/ctxNN_<rate>_<ch>.pcm "
++                    "(signed 16-bit big-endian) in the working folder (diagnostics only)");
 +
  namespace rex::audio {
  
@@ -84,12 +95,40 @@ index d36dc6f..8837365 100644
 +  return (uint32_t(d.output_buffer_write_offset) + n - uint32_t(d.output_buffer_read_offset)) % n;
 +}
 +std::array<TraceState, 320> g_xma_trace_state;
++
++struct DumpState {
++  std::FILE* f = nullptr;
++  uint32_t rate = 0, stereo = 0;
++};
++std::array<DumpState, 320> g_xma_dump;
++
++void DumpWrite(uint32_t id, uint32_t rate_id, uint32_t stereo, const uint8_t* p, size_t n) {
++  if (id >= g_xma_dump.size() || !n) return;
++  static const uint32_t kRates[4] = {24000, 32000, 44100, 48000};
++  const uint32_t rate = kRates[rate_id & 3];
++  auto& d = g_xma_dump[id];
++  if (!d.f || d.rate != rate || d.stereo != stereo) {
++    if (d.f) std::fclose(d.f);
++    std::error_code ec;
++    std::filesystem::create_directories("xma_dump", ec);
++    char name[96];
++    std::snprintf(name, sizeof(name), "xma_dump/ctx%02u_%u_%s.pcm", id, rate,
++                  stereo ? "stereo" : "mono");
++    d.f = std::fopen(name, "ab");
++    d.rate = rate;
++    d.stereo = stereo;
++  }
++  if (d.f) {
++    std::fwrite(p, 1, n, d.f);
++    std::fflush(d.f);
++  }
++}
 +}  // namespace
 +
  using stream::BitStream;
  
  const uint32_t XmaContext::kBitsPerPacketHeader;
-@@ -104,6 +136,44 @@ bool XmaContext::Work() {
+@@ -104,6 +175,44 @@ bool XmaContext::Work() {
    XMA_CONTEXT_DATA data(context_ptr);
    const XMA_CONTEXT_DATA initial_data = data;
  
@@ -134,7 +173,7 @@ index d36dc6f..8837365 100644
    if (!data.output_buffer_valid) {
      return true;
    }
-@@ -134,6 +204,9 @@ bool XmaContext::Work() {
+@@ -134,6 +243,9 @@ bool XmaContext::Work() {
  
    while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
      Decode(&data);
@@ -144,7 +183,7 @@ index d36dc6f..8837365 100644
      Consume(&output_rb, &data);
  
      if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
-@@ -143,6 +216,16 @@ bool XmaContext::Work() {
+@@ -143,6 +255,16 @@ bool XmaContext::Work() {
  
    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
  
@@ -161,7 +200,7 @@ index d36dc6f..8837365 100644
    if (output_rb.empty()) {
      data.output_buffer_valid = 0;
    }
-@@ -200,6 +283,25 @@ void XmaContext::ResetDecoderState() {
+@@ -200,6 +322,25 @@ void XmaContext::ResetDecoderState() {
    current_frame_remaining_subframes_ = 0;
    loop_frame_output_limit_ = 0;
    loop_start_skip_pending_ = false;
@@ -187,7 +226,7 @@ index d36dc6f..8837365 100644
  }
  
  void XmaContext::Disable() {
-@@ -239,6 +341,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -239,6 +380,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
      return;
    }
  
@@ -198,7 +237,7 @@ index d36dc6f..8837365 100644
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
  
-@@ -445,10 +551,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -445,11 +590,15 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const int8_t raw_frame_read_offset =
@@ -209,9 +248,15 @@ index d36dc6f..8837365 100644
 -  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
 +  output_rb->Write(out_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
                     subframes_to_write * kOutputBytesPerBlock);
++  if (REXCVAR_GET(xma_dump)) {
++    DumpWrite(id(), data->sample_rate, data->is_stereo,
++              out_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
++              subframes_to_write * kOutputBytesPerBlock);
++  }
  
    const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
-@@ -614,6 +719,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+                               ? data->output_buffer_padding
+@@ -614,6 +763,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
    }
  
@@ -228,7 +273,7 @@ index d36dc6f..8837365 100644
    BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
    stream.SetOffset(data->input_buffer_read_offset);
  
-@@ -656,23 +771,99 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -656,23 +815,101 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (DecodePacket(av_context_, av_packet_, av_frame_)) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   raw_frame_.data());
@@ -279,7 +324,9 @@ index d36dc6f..8837365 100644
 +    // long and occupies decoder output [start + 64, N*512 + 192 - end).
 +    // (Same accounting as vgmstream's xma_fix_raw_samples.)
 +    if (REXCVAR_GET(xma_honor_stream_skip)) {
-+      constexpr uint32_t kDelay = kSamplesPerSubframe / 2;  // 64
++      const bool delay_mode = REXCVAR_GET(xma_skip_mode) == 2;
++      const uint32_t kDelay = delay_mode ? kSamplesPerSubframe / 2 : 0;  // 64
++      const uint32_t kTail = delay_mode ? kSamplesPerSubframe : 0;       // final IMDCT subframe
 +      const AVDictionaryEntry* start_e = av_dict_get(av_frame_->metadata, "xma_start_skip", nullptr, 0);
 +      const AVDictionaryEntry* end_e = av_dict_get(av_frame_->metadata, "xma_end_skip", nullptr, 0);
 +      const uint32_t start_skip = start_e ? std::min<uint32_t>(kSamplesPerFrame, std::atoi(start_e->value)) : 0;
@@ -298,11 +345,11 @@ index d36dc6f..8837365 100644
 +        }
 +      }
 +      if (end_e && !is_loop_end_frame) {
-+        const uint32_t stream_end = kSamplesPerFrame + kSamplesPerSubframe + kDelay - end_skip;
++        const uint32_t stream_end = kSamplesPerFrame + kTail + kDelay - end_skip;
 +        if (stream_end < kSamplesPerFrame) {
 +          drop(stream_end, kSamplesPerFrame);
 +        } else {
-+          tail_keep_ = std::min<uint32_t>(kSamplesPerSubframe, stream_end - kSamplesPerFrame);
++          tail_keep_ = std::min<uint32_t>(kTail, stream_end - kSamplesPerFrame);
 +        }
 +      }
 +    }
