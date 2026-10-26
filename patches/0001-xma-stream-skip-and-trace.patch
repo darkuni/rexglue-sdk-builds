@@ -33,8 +33,84 @@ index ab387be..93ece38 100644
  };
  
  }  // namespace rex::audio
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 46719f3..45e3be2 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -24,6 +25,23 @@
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_BOOL(audio_trace, false, "Audio",
++                    "Log every time the output device needs audio and the game has none queued "
++                    "(silence is inserted - an audible dropout)");
++REXCVAR_DEFINE_BOOL(audio_dump, false, "Audio",
++                    "Write the game's final mix (audio_mix.f32) and what was actually sent to the "
++                    "device including inserted silence (audio_device.f32), stereo float32 48 kHz");
++
++namespace {
++std::FILE* g_mix_dump = nullptr;
++std::FILE* g_dev_dump = nullptr;
++std::FILE* OpenDump(std::FILE*& f, const char* name) {
++  if (!f) f = std::fopen(name, "wb");
++  return f;
++}
++uint64_t g_underruns = 0;
++uint64_t g_frames_played = 0;
++}  // namespace
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -115,6 +133,13 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
++  if (REXCVAR_GET(audio_dump)) {
++    float st[channel_samples_ * 2];
++    conversion::sequential_6_BE_to_interleaved_2_LE(st, output_frame, channel_samples_);
++    if (OpenDump(g_mix_dump, "audio_mix.f32")) {
++      std::fwrite(st, sizeof(float), channel_samples_ * 2, g_mix_dump);
++    }
++  }
+ 
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+@@ -175,6 +200,14 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+         sdl_callback_count++;
+       }
+       std::memset(data, 0, len);
++      g_underruns++;
++      if (REXCVAR_GET(audio_trace)) {
++        REXAPU_INFO("[audio] device underrun #{} after {} frames: inserted {} ms of silence",
++                    g_underruns, g_frames_played, channel_samples_ * 1000 / frame_frequency_);
++      }
++      if (REXCVAR_GET(audio_dump) && OpenDump(g_dev_dump, "audio_device.f32")) {
++        std::fwrite(data, 1, len, g_dev_dump);
++      }
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+@@ -198,6 +231,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+             break;
+         }
+       }
++      g_frames_played++;
++      if (REXCVAR_GET(audio_dump) && OpenDump(g_dev_dump, "audio_device.f32")) {
++        std::fwrite(data, 1, len, g_dev_dump);
++      }
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+         driver->frames_unused_.push(buffer);
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..294e3d1 100644
+index d36dc6f..a7ee2b4 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -15,6 +15,12 @@
@@ -76,7 +152,7 @@ index d36dc6f..294e3d1 100644
 +                     "1 = on raw decoder output, 2 = corrected for FFmpeg's 64-sample decoder "
 +                     "delay and the final IMDCT subframe (vgmstream accounting)");
 +
-+REXCVAR_DEFINE_INT32(xma_declick, 64, "Audio",
++REXCVAR_DEFINE_INT32(xma_declick, 0, "Audio",
 +                     "At every splice the decoder makes (a stream starting or restarting, or a "
 +                     "re-submitted loop wrapping) ramp from the previously output sample into the "
 +                     "new audio over this many samples, removing the step that clicks. 0 = off");
