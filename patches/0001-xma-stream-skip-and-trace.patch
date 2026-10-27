@@ -1,5 +1,5 @@
 diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
-index ab387be..93ece38 100644
+index ab387be..6c0c729 100644
 --- a/include/rex/audio/xma/context.h
 +++ b/include/rex/audio/xma/context.h
 @@ -245,6 +245,7 @@ class XmaContext {
@@ -10,7 +10,7 @@ index ab387be..93ece38 100644
  
    memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
    int PrepareDecoder(int sample_rate, bool is_two_channel);
-@@ -285,6 +286,22 @@ class XmaContext {
+@@ -285,6 +286,27 @@ class XmaContext {
    // Loop subframe precision state
    uint8_t loop_frame_output_limit_ = 0;
    bool loop_start_skip_pending_ = false;
@@ -30,6 +30,11 @@ index ab387be..93ece38 100644
 +  // Declicker: last emitted sample per channel, and a pending splice.
 +  int16_t last_out_[2] = {0, 0};
 +  bool splice_pending_ = true;
++  // Last sample the game's mixer has actually consumed (from the output
++  // buffer just behind its read offset) - where a restart should ramp from.
++  int16_t last_played_[2] = {0, 0};
++  bool have_played_ = false;
++  uint32_t prev_read_offset_ = 0;
  };
  
  }  // namespace rex::audio
@@ -110,7 +115,7 @@ index 46719f3..45e3be2 100644
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
          driver->frames_unused_.push(buffer);
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..a7ee2b4 100644
+index d36dc6f..bcbdc62 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -15,6 +15,12 @@
@@ -152,7 +157,7 @@ index d36dc6f..a7ee2b4 100644
 +                     "1 = on raw decoder output, 2 = corrected for FFmpeg's 64-sample decoder "
 +                     "delay and the final IMDCT subframe (vgmstream accounting)");
 +
-+REXCVAR_DEFINE_INT32(xma_declick, 0, "Audio",
++REXCVAR_DEFINE_INT32(xma_declick, 128, "Audio",
 +                     "At every splice the decoder makes (a stream starting or restarting, or a "
 +                     "re-submitted loop wrapping) ramp from the previously output sample into the "
 +                     "new audio over this many samples, removing the step that clicks. 0 = off");
@@ -212,7 +217,7 @@ index d36dc6f..a7ee2b4 100644
  using stream::BitStream;
  
  const uint32_t XmaContext::kBitsPerPacketHeader;
-@@ -104,6 +180,44 @@ bool XmaContext::Work() {
+@@ -104,12 +180,66 @@ bool XmaContext::Work() {
    XMA_CONTEXT_DATA data(context_ptr);
    const XMA_CONTEXT_DATA initial_data = data;
  
@@ -257,7 +262,29 @@ index d36dc6f..a7ee2b4 100644
    if (!data.output_buffer_valid) {
      return true;
    }
-@@ -134,6 +248,9 @@ bool XmaContext::Work() {
+ 
+   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+ 
++  // Remember the sample the mixer consumed last, so a restart (the game
++  // re-initialising this context mid-sound) can ramp from what is actually
++  // being heard rather than from what the decoder wrote ahead.
++  if (data.output_buffer_block_count &&
++      data.output_buffer_read_offset != prev_read_offset_) {
++    const uint32_t n = data.output_buffer_block_count;
++    const uint32_t blk = (uint32_t(data.output_buffer_read_offset) + n - 1) % n;
++    const uint32_t fb = kBytesPerSample << data.is_stereo;
++    const uint8_t* p = memory()->TranslatePhysical(data.output_buffer_ptr) +
++                       blk * kOutputBytesPerBlock + kOutputBytesPerBlock - fb;
++    last_played_[0] = int16_t((p[0] << 8) | p[1]);
++    last_played_[1] = data.is_stereo ? int16_t((p[2] << 8) | p[3]) : last_played_[0];
++    have_played_ = true;
++    prev_read_offset_ = data.output_buffer_read_offset;
++  }
++
+   // Consume-only context: no input, just drain remaining subframes.
+   if (data.IsConsumeOnlyContext()) {
+     if (current_frame_remaining_subframes_ == 0) {
+@@ -134,6 +264,9 @@ bool XmaContext::Work() {
  
    while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
      Decode(&data);
@@ -267,7 +294,7 @@ index d36dc6f..a7ee2b4 100644
      Consume(&output_rb, &data);
  
      if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
-@@ -143,6 +260,16 @@ bool XmaContext::Work() {
+@@ -143,6 +276,16 @@ bool XmaContext::Work() {
  
    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
  
@@ -284,7 +311,7 @@ index d36dc6f..a7ee2b4 100644
    if (output_rb.empty()) {
      data.output_buffer_valid = 0;
    }
-@@ -200,6 +327,26 @@ void XmaContext::ResetDecoderState() {
+@@ -200,6 +343,32 @@ void XmaContext::ResetDecoderState() {
    current_frame_remaining_subframes_ = 0;
    loop_frame_output_limit_ = 0;
    loop_start_skip_pending_ = false;
@@ -293,6 +320,12 @@ index d36dc6f..a7ee2b4 100644
 +  pending_drop_ = 0;
 +  tail_keep_ = 0;
 +  splice_pending_ = true;
++  if (have_played_) {
++    last_out_[0] = last_played_[0];
++    last_out_[1] = last_played_[1];
++  }
++  have_played_ = false;
++  prev_read_offset_ = 0;
 +}
 +
 +void XmaContext::FlushCarry() {
@@ -311,7 +344,7 @@ index d36dc6f..a7ee2b4 100644
  }
  
  void XmaContext::Disable() {
-@@ -239,6 +386,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -239,6 +408,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
      return;
    }
  
@@ -322,7 +355,7 @@ index d36dc6f..a7ee2b4 100644
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
  
-@@ -445,11 +596,15 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -445,11 +618,15 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const int8_t raw_frame_read_offset =
@@ -341,7 +374,7 @@ index d36dc6f..a7ee2b4 100644
  
    const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                                ? data->output_buffer_padding
-@@ -614,6 +769,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -614,6 +791,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
    }
  
@@ -358,7 +391,7 @@ index d36dc6f..a7ee2b4 100644
    BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
    stream.SetOffset(data->input_buffer_read_offset);
  
-@@ -656,23 +821,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -656,23 +843,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (DecodePacket(av_context_, av_packet_, av_frame_)) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   raw_frame_.data());
