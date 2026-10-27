@@ -115,7 +115,7 @@ index 46719f3..45e3be2 100644
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
          driver->frames_unused_.push(buffer);
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..bcbdc62 100644
+index d36dc6f..8cdb6f2 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -15,6 +15,12 @@
@@ -139,7 +139,7 @@ index d36dc6f..bcbdc62 100644
  #include "libavutil/error.h"
  #if REX_COMPILER_MSVC
  #pragma warning(pop)
-@@ -36,8 +43,77 @@ extern "C" {
+@@ -36,8 +43,85 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -162,6 +162,12 @@ index d36dc6f..bcbdc62 100644
 +                     "re-submitted loop wrapping) ramp from the previously output sample into the "
 +                     "new audio over this many samples, removing the step that clicks. 0 = off");
 +
++REXCVAR_DEFINE_INT32(xma_ring_gap, 1, "Audio",
++                     "Output blocks the decoder always leaves free in a context's output ring. "
++                     "A completely full ring has read offset == write offset, which is "
++                     "indistinguishable from an empty one: the decoder then overwrote audio the "
++                     "game had not played yet (crackle). 0 = old behaviour");
++
 +REXCVAR_DEFINE_BOOL(xma_dump, false, "Audio",
 +                    "Write every XMA context's decoded output to xma_dump/ctxNN_<rate>_<ch>.pcm "
 +                    "(signed 16-bit big-endian) in the working folder (diagnostics only)");
@@ -176,6 +182,8 @@ index d36dc6f..bcbdc62 100644
 +  bool starved = false;
 +  std::chrono::steady_clock::time_point starve_time;
 +  uint32_t starve_fill = 0;
++  bool ended_full = false;
++  uint32_t overwrite_risks = 0;
 +};
 +
 +uint32_t OutputFillBlocks(const rex::audio::XMA_CONTEXT_DATA& d) {
@@ -217,7 +225,7 @@ index d36dc6f..bcbdc62 100644
  using stream::BitStream;
  
  const uint32_t XmaContext::kBitsPerPacketHeader;
-@@ -104,12 +180,66 @@ bool XmaContext::Work() {
+@@ -104,12 +188,77 @@ bool XmaContext::Work() {
    XMA_CONTEXT_DATA data(context_ptr);
    const XMA_CONTEXT_DATA initial_data = data;
  
@@ -259,6 +267,17 @@ index d36dc6f..bcbdc62 100644
 +    }
 +  }
 +
++  if (REXCVAR_GET(xma_trace) && id() < g_xma_trace_state.size() && data.output_buffer_valid) {
++    auto& st = g_xma_trace_state[id()];
++    if (st.ended_full && data.output_buffer_read_offset == data.output_buffer_write_offset) {
++      st.overwrite_risks++;
++      REXAPU_INFO("[xma] ctx {} output re-validated while still full (read == write == {}): "
++                  "ambiguous full/empty ring, #{}",
++                  id(), uint32_t(data.output_buffer_read_offset), st.overwrite_risks);
++    }
++    st.ended_full = false;
++  }
++
    if (!data.output_buffer_valid) {
      return true;
    }
@@ -284,7 +303,7 @@ index d36dc6f..bcbdc62 100644
    // Consume-only context: no input, just drain remaining subframes.
    if (data.IsConsumeOnlyContext()) {
      if (current_frame_remaining_subframes_ == 0) {
-@@ -134,6 +264,9 @@ bool XmaContext::Work() {
+@@ -134,6 +283,9 @@ bool XmaContext::Work() {
  
    while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
      Decode(&data);
@@ -294,10 +313,11 @@ index d36dc6f..bcbdc62 100644
      Consume(&output_rb, &data);
  
      if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
-@@ -143,6 +276,16 @@ bool XmaContext::Work() {
+@@ -143,8 +295,24 @@ bool XmaContext::Work() {
  
    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
  
+-  if (output_rb.empty()) {
 +  if (REXCVAR_GET(xma_trace) && id() < g_xma_trace_state.size() &&
 +      !data.IsAnyInputBufferValid()) {
 +    auto& st = g_xma_trace_state[id()];
@@ -308,10 +328,18 @@ index d36dc6f..bcbdc62 100644
 +    }
 +  }
 +
-   if (output_rb.empty()) {
++  if (output_rb.empty() ||
++      (REXCVAR_GET(xma_ring_gap) > 0 && remaining_subframe_blocks_in_output_buffer_ <= 0)) {
++    // Empty, or full with the gap kept free: tell the game, as before.
      data.output_buffer_valid = 0;
++    if (id() < g_xma_trace_state.size()) {
++      g_xma_trace_state[id()].ended_full =
++          data.output_buffer_write_offset != initial_data.output_buffer_write_offset;
++    }
    }
-@@ -200,6 +343,32 @@ void XmaContext::ResetDecoderState() {
+ 
+   StoreContextMerged(data, initial_data, context_ptr);
+@@ -200,6 +368,32 @@ void XmaContext::ResetDecoderState() {
    current_frame_remaining_subframes_ = 0;
    loop_frame_output_limit_ = 0;
    loop_start_skip_pending_ = false;
@@ -344,7 +372,7 @@ index d36dc6f..bcbdc62 100644
  }
  
  void XmaContext::Disable() {
-@@ -239,6 +408,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -239,6 +433,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
      return;
    }
  
@@ -355,7 +383,19 @@ index d36dc6f..bcbdc62 100644
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
  
-@@ -445,11 +618,15 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -332,6 +530,11 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+   output_rb.set_write_offset(output_write_offset);
+   remaining_subframe_blocks_in_output_buffer_ =
+       static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
++  const int32_t gap = std::max(0, int32_t(REXCVAR_GET(xma_ring_gap)));
++  if (gap && data->output_buffer_block_count > uint32_t(gap)) {
++    remaining_subframe_blocks_in_output_buffer_ =
++        std::max(0, remaining_subframe_blocks_in_output_buffer_ - gap);
++  }
+ 
+   return output_rb;
+ }
+@@ -445,11 +648,15 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const int8_t raw_frame_read_offset =
@@ -374,7 +414,7 @@ index d36dc6f..bcbdc62 100644
  
    const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                                ? data->output_buffer_padding
-@@ -614,6 +791,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -614,6 +821,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
    }
  
@@ -391,7 +431,7 @@ index d36dc6f..bcbdc62 100644
    BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
    stream.SetOffset(data->input_buffer_read_offset);
  
-@@ -656,23 +843,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -656,23 +873,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (DecodePacket(av_context_, av_packet_, av_frame_)) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   raw_frame_.data());
