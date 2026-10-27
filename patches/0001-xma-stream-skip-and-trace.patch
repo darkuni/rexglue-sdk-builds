@@ -1,5 +1,5 @@
 diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
-index ab387be..12af41b 100644
+index ab387be..0c094a5 100644
 --- a/include/rex/audio/xma/context.h
 +++ b/include/rex/audio/xma/context.h
 @@ -12,6 +12,7 @@
@@ -10,7 +10,15 @@ index ab387be..12af41b 100644
  #include <atomic>
  #include <mutex>
  
-@@ -245,6 +246,7 @@ class XmaContext {
+@@ -215,6 +216,7 @@ class XmaContext {
+   }
+   void set_is_enabled(bool is_enabled) { is_enabled_.store(is_enabled, std::memory_order_release); }
+ 
++  bool holding() const { return start_hold_until_ns_ != 0; }
+   void SignalWorkDone() {
+     if (work_completion_event_) {
+       work_completion_event_->Set();
+@@ -245,6 +247,7 @@ class XmaContext {
    void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
    void ClearLocked(XMA_CONTEXT_DATA* data);
    void ResetDecoderState();
@@ -18,7 +26,7 @@ index ab387be..12af41b 100644
  
    memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
    int PrepareDecoder(int sample_rate, bool is_two_channel);
-@@ -285,6 +287,34 @@ class XmaContext {
+@@ -285,6 +288,35 @@ class XmaContext {
    // Loop subframe precision state
    uint8_t loop_frame_output_limit_ = 0;
    bool loop_start_skip_pending_ = false;
@@ -46,6 +54,7 @@ index ab387be..12af41b 100644
 +  int64_t ring_full_time_ns_ = 0;
 +  uint32_t blocks_written_ = 0;
 +  bool stalled_ = false;
++  int64_t start_hold_until_ns_ = 0;
 +  uint32_t clip_ptr_ = 0;
 +  std::string clip_name_ = "?";
 +  bool clip_muted_ = false;  // Decode is waiting for the next input buffer  // output blocks written during the current Work()
@@ -130,7 +139,7 @@ index 46719f3..45e3be2 100644
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
          driver->frames_unused_.push(buffer);
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..6789f17 100644
+index d36dc6f..c626029 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -15,6 +15,14 @@
@@ -156,7 +165,7 @@ index d36dc6f..6789f17 100644
  #include "libavutil/error.h"
  #if REX_COMPILER_MSVC
  #pragma warning(pop)
-@@ -36,8 +45,169 @@ extern "C" {
+@@ -36,8 +45,173 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -174,6 +183,9 @@ index d36dc6f..6789f17 100644
 +                     "1 = on raw decoder output, 2 = corrected for FFmpeg's 64-sample decoder "
 +                     "delay and the final IMDCT subframe (vgmstream accounting)");
 +
++REXCVAR_DEFINE_INT32(xma_start_latency_us, 0, "Audio",
++                     "Hold a freshly cleared (restarted) context's first decode for this many "
++                     "microseconds, like real hardware decode latency. 0 = decode on kick.");
 +REXCVAR_DEFINE_INT32(xma_declick, 128, "Audio",
 +                     "At every splice the decoder makes (a stream starting or restarting, or a "
 +                     "re-submitted loop wrapping) ramp from the previously output sample into the "
@@ -300,6 +312,7 @@ index d36dc6f..6789f17 100644
 +};
 +std::array<DumpState, 320> g_xma_dump;
 +
++
 +void DumpWrite(uint32_t id, uint32_t rate_id, uint32_t stereo, const uint8_t* p, size_t n) {
 +  if (id >= g_xma_dump.size() || !n) return;
 +  static const uint32_t kRates[4] = {24000, 32000, 44100, 48000};
@@ -326,7 +339,21 @@ index d36dc6f..6789f17 100644
  using stream::BitStream;
  
  const uint32_t XmaContext::kBitsPerPacketHeader;
-@@ -104,12 +274,121 @@ bool XmaContext::Work() {
+@@ -98,18 +272,135 @@ bool XmaContext::Work() {
+   }
+ 
+   std::lock_guard<std::mutex> lock(lock_);
++  if (start_hold_until_ns_) {
++    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                            std::chrono::steady_clock::now().time_since_epoch()).count();
++    if (now < start_hold_until_ns_) {
++      return false;  // stay enabled; the worker sweeps again shortly
++    }
++    start_hold_until_ns_ = 0;
++  }
+   set_is_enabled(false);
+ 
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
    XMA_CONTEXT_DATA data(context_ptr);
    const XMA_CONTEXT_DATA initial_data = data;
  
@@ -448,7 +475,7 @@ index d36dc6f..6789f17 100644
    // Consume-only context: no input, just drain remaining subframes.
    if (data.IsConsumeOnlyContext()) {
      if (current_frame_remaining_subframes_ == 0) {
-@@ -127,24 +406,65 @@ bool XmaContext::Work() {
+@@ -127,24 +418,65 @@ bool XmaContext::Work() {
    const int32_t minimum_subframe_decode_count =
        static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
  
@@ -515,10 +542,15 @@ index d36dc6f..6789f17 100644
    }
  
    StoreContextMerged(data, initial_data, context_ptr);
-@@ -178,6 +498,23 @@ void XmaContext::Clear() {
+@@ -178,6 +510,28 @@ void XmaContext::Clear() {
  }
  
  void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
++  if (const int32_t us = REXCVAR_GET(xma_start_latency_us); us > 0) {
++    start_hold_until_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch()).count() +
++                           int64_t(us) * 1000;
++  }
 +  if (REXCVAR_GET(xma_trace) && id() < g_xma_trace_state.size()) {
 +    auto& st = g_xma_trace_state[id()];
 +    REXAPU_INFO("[xma] ctx {} clear: out rd={} wr={} valid={} blocks={} in_valid={}/{}", id(),
@@ -539,7 +571,7 @@ index d36dc6f..6789f17 100644
    data->input_buffer_0_valid = 0;
    data->input_buffer_1_valid = 0;
    data->output_buffer_valid = 0;
-@@ -200,6 +537,33 @@ void XmaContext::ResetDecoderState() {
+@@ -200,6 +554,33 @@ void XmaContext::ResetDecoderState() {
    current_frame_remaining_subframes_ = 0;
    loop_frame_output_limit_ = 0;
    loop_start_skip_pending_ = false;
@@ -573,7 +605,7 @@ index d36dc6f..6789f17 100644
  }
  
  void XmaContext::Disable() {
-@@ -239,6 +603,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -239,6 +620,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
      return;
    }
  
@@ -584,7 +616,7 @@ index d36dc6f..6789f17 100644
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
  
-@@ -332,6 +700,28 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+@@ -332,6 +717,28 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
    output_rb.set_write_offset(output_write_offset);
    remaining_subframe_blocks_in_output_buffer_ =
        static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
@@ -613,7 +645,7 @@ index d36dc6f..6789f17 100644
  
    return output_rb;
  }
-@@ -445,16 +835,26 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -445,16 +852,26 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const int8_t raw_frame_read_offset =
@@ -644,7 +676,7 @@ index d36dc6f..6789f17 100644
    remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write + headroom;
    current_frame_remaining_subframes_ -= subframes_to_write;
  }
-@@ -596,6 +996,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -596,6 +1013,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (packet_info.current_frame_size_ == 0) {
      const uint8_t* next_packet = GetNextPacket(data, next_packet_index, current_input_packet_count);
      if (!next_packet) {
@@ -660,7 +692,7 @@ index d36dc6f..6789f17 100644
        SwapInputBuffer(data);
        return;
      }
-@@ -614,6 +1023,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -614,6 +1040,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
    }
  
@@ -677,7 +709,7 @@ index d36dc6f..6789f17 100644
    BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
    stream.SetOffset(data->input_buffer_read_offset);
  
-@@ -631,6 +1050,18 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -631,6 +1067,18 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
        const uint8_t* next_packet =
            GetNextPacket(data, next_packet_index, current_input_packet_count);
        if (!next_packet) {
@@ -696,7 +728,7 @@ index d36dc6f..6789f17 100644
          data->error_status = 4;
          return;
        }
-@@ -656,23 +1087,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -656,23 +1104,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (DecodePacket(av_context_, av_packet_, av_frame_)) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   raw_frame_.data());
@@ -837,3 +869,38 @@ index d36dc6f..6789f17 100644
    }
  
    // Compute where to go next.
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index a0a178d..ded5d44 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -19,6 +19,8 @@
+ #include <rex/memory/ring_buffer.h>
+ #include <rex/string/buffer.h>
+ #include <rex/system/function_dispatcher.h>
++
++REXCVAR_DECLARE(int32_t, xma_start_latency_us);
+ #include <rex/system/thread_state.h>
+ #include <rex/system/xthread.h>
+ 
+@@ -159,8 +161,19 @@ void XmaDecoder::WorkerThreadMain() {
+     if (did_work) {
+       continue;
+     }
+-    // No work done this iteration, block until signaled.
+-    rex::thread::Wait(work_event_.get(), false);
++    // No work done this iteration, block until signaled (or, while contexts
++    // are held for start latency, until the next short sweep).
++    bool holding = false;
++    if (REXCVAR_GET(xma_start_latency_us) > 0) {
++      for (uint32_t n = 0; n < kContextCount && !holding; n++) {
++        holding = contexts_[n].holding();
++      }
++    }
++    if (holding) {
++      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(1));
++    } else {
++      rex::thread::Wait(work_event_.get(), false);
++    }
+   }
+ }
+ 
