@@ -1,8 +1,16 @@
 diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
-index ab387be..6c8c0e6 100644
+index ab387be..12af41b 100644
 --- a/include/rex/audio/xma/context.h
 +++ b/include/rex/audio/xma/context.h
-@@ -245,6 +245,7 @@ class XmaContext {
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <string>
+ #include <atomic>
+ #include <mutex>
+ 
+@@ -245,6 +246,7 @@ class XmaContext {
    void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
    void ClearLocked(XMA_CONTEXT_DATA* data);
    void ResetDecoderState();
@@ -10,7 +18,7 @@ index ab387be..6c8c0e6 100644
  
    memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
    int PrepareDecoder(int sample_rate, bool is_two_channel);
-@@ -285,6 +286,31 @@ class XmaContext {
+@@ -285,6 +287,34 @@ class XmaContext {
    // Loop subframe precision state
    uint8_t loop_frame_output_limit_ = 0;
    bool loop_start_skip_pending_ = false;
@@ -37,7 +45,10 @@ index ab387be..6c8c0e6 100644
 +  bool ring_full_ = false;  // last Work filled the output ring (read == write means full)
 +  int64_t ring_full_time_ns_ = 0;
 +  uint32_t blocks_written_ = 0;
-+  bool stalled_ = false;  // Decode is waiting for the next input buffer  // output blocks written during the current Work()
++  bool stalled_ = false;
++  uint32_t clip_ptr_ = 0;
++  std::string clip_name_ = "?";
++  bool clip_muted_ = false;  // Decode is waiting for the next input buffer  // output blocks written during the current Work()
 +  uint32_t prev_read_offset_ = 0;
  };
  
@@ -119,10 +130,10 @@ index 46719f3..45e3be2 100644
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
          driver->frames_unused_.push(buffer);
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..fe5588f 100644
+index d36dc6f..6789f17 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
-@@ -15,6 +15,12 @@
+@@ -15,6 +15,14 @@
  #include <rex/audio/xma/context.h>
  #include <rex/audio/xma/decoder.h>
  #include <rex/audio/xma/helpers.h>
@@ -130,12 +141,14 @@ index d36dc6f..fe5588f 100644
 +
 +#include <array>
 +#include <chrono>
++#include <string>
++#include <unordered_map>
 +#include <cstdio>
 +#include <filesystem>
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/memory/ring_buffer.h>
-@@ -27,6 +33,7 @@ extern "C" {
+@@ -27,6 +35,7 @@ extern "C" {
  #pragma warning(disable : 4101 4244 5033)
  #endif
  #include "libavcodec/avcodec.h"
@@ -143,7 +156,7 @@ index d36dc6f..fe5588f 100644
  #include "libavutil/error.h"
  #if REX_COMPILER_MSVC
  #pragma warning(pop)
-@@ -36,8 +43,115 @@ extern "C" {
+@@ -36,8 +45,169 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -193,6 +206,14 @@ index d36dc6f..fe5588f 100644
 +                    "marked that buffer valid yet, wait for it (as the hardware does) instead of "
 +                    "raising decode error 4 - which made XAudio kill the voice mid-sound");
 +
++REXCVAR_DEFINE_STRING(xma_mute, "", "Audio",
++                      "Comma-separated clip-name prefixes to silence (names from xma_clips.txt "
++                      "next to the exe, e.g. \"ICS_099,ICS_1\"; \"?\" = clips not in the "
++                      "table; \"*\" = everything). Diagnostics: find which sound pops");
++
++REXCVAR_DEFINE_STRING(xma_solo, "", "Audio",
++                      "Like xma_mute, but silences every clip NOT matching these prefixes");
++
 +REXCVAR_DEFINE_BOOL(xma_clear_output, false, "Audio",
 +                    "Zero a context's output buffer when the game resets the context, so a "
 +                    "mixer that reads it before new audio is decoded hears silence instead of "
@@ -227,6 +248,52 @@ index d36dc6f..fe5588f 100644
 +}
 +std::array<TraceState, 320> g_xma_trace_state;
 +
++// --- clip identification (diagnostics) ---------------------------------
++// xma_clips.txt: "<fnv1a64 of the first 2 KB packet, hex> <name>" per line.
++std::mutex g_clip_mu;
++std::unordered_map<uint64_t, std::string> g_clip_names;
++bool g_clip_loaded = false;
++
++void LoadClipTable() {
++  if (g_clip_loaded) return;
++  g_clip_loaded = true;
++  std::FILE* f = std::fopen("xma_clips.txt", "r");
++  if (!f) return;
++  char line[256];
++  while (std::fgets(line, sizeof(line), f)) {
++    unsigned long long h = 0;
++    char name[200] = {};
++    if (std::sscanf(line, "%llx %199s", &h, name) == 2) g_clip_names[h] = name;
++  }
++  std::fclose(f);
++  REXAPU_INFO("[xma] loaded {} clip names from xma_clips.txt", g_clip_names.size());
++}
++
++uint64_t Fnv1a(const uint8_t* p, size_t n) {
++  uint64_t h = 0xcbf29ce484222325ull;
++  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
++  return h;
++}
++
++bool PrefixListMatches(const std::string& list, const std::string& name) {
++  size_t i = 0;
++  while (i <= list.size()) {
++    size_t j = list.find(',', i);
++    if (j == std::string::npos) j = list.size();
++    std::string tok = list.substr(i, j - i);
++    while (!tok.empty() && tok.front() == ' ') tok.erase(0, 1);
++    while (!tok.empty() && tok.back() == ' ') tok.pop_back();
++    if (!tok.empty()) {
++      if (tok == "*") return true;
++      if (tok == "?" && name == "?") return true;
++      if (name.compare(0, tok.size(), tok) == 0) return true;
++    }
++    i = j + 1;
++  }
++  return false;
++}
++
++
 +struct DumpState {
 +  std::FILE* f = nullptr;
 +  uint32_t rate = 0, stereo = 0;
@@ -259,7 +326,7 @@ index d36dc6f..fe5588f 100644
  using stream::BitStream;
  
  const uint32_t XmaContext::kBitsPerPacketHeader;
-@@ -104,12 +218,102 @@ bool XmaContext::Work() {
+@@ -104,12 +274,121 @@ bool XmaContext::Work() {
    XMA_CONTEXT_DATA data(context_ptr);
    const XMA_CONTEXT_DATA initial_data = data;
  
@@ -340,6 +407,25 @@ index d36dc6f..fe5588f 100644
      return true;
    }
  
++  // Identify the clip (diagnostics: xma_mute / xma_solo, trace).
++  {
++    const uint32_t in_ptr = data.current_buffer ? data.input_buffer_1_ptr : data.input_buffer_0_ptr;
++    if (in_ptr && in_ptr != clip_ptr_) {
++      clip_ptr_ = in_ptr;
++      std::lock_guard<std::mutex> lk(g_clip_mu);
++      LoadClipTable();
++      const uint8_t* p = memory()->TranslatePhysical(in_ptr);
++      const auto it = p ? g_clip_names.find(Fnv1a(p, 2048)) : g_clip_names.end();
++      clip_name_ = it != g_clip_names.end() ? it->second : std::string("?");
++      if (REXCVAR_GET(xma_trace)) {
++        REXAPU_INFO("[xma] ctx {} clip {}", id(), clip_name_);
++      }
++    }
++    const std::string mute = REXCVAR_GET(xma_mute);
++    const std::string solo = REXCVAR_GET(xma_solo);
++    clip_muted_ = (!mute.empty() && PrefixListMatches(mute, clip_name_)) ||
++                  (!solo.empty() && !PrefixListMatches(solo, clip_name_));
++  }
 +  blocks_written_ = 0;
    memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
  
@@ -362,7 +448,7 @@ index d36dc6f..fe5588f 100644
    // Consume-only context: no input, just drain remaining subframes.
    if (data.IsConsumeOnlyContext()) {
      if (current_frame_remaining_subframes_ == 0) {
-@@ -127,24 +331,65 @@ bool XmaContext::Work() {
+@@ -127,24 +406,65 @@ bool XmaContext::Work() {
    const int32_t minimum_subframe_decode_count =
        static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
  
@@ -429,7 +515,7 @@ index d36dc6f..fe5588f 100644
    }
  
    StoreContextMerged(data, initial_data, context_ptr);
-@@ -178,6 +423,23 @@ void XmaContext::Clear() {
+@@ -178,6 +498,23 @@ void XmaContext::Clear() {
  }
  
  void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
@@ -453,7 +539,7 @@ index d36dc6f..fe5588f 100644
    data->input_buffer_0_valid = 0;
    data->input_buffer_1_valid = 0;
    data->output_buffer_valid = 0;
-@@ -200,6 +462,33 @@ void XmaContext::ResetDecoderState() {
+@@ -200,6 +537,33 @@ void XmaContext::ResetDecoderState() {
    current_frame_remaining_subframes_ = 0;
    loop_frame_output_limit_ = 0;
    loop_start_skip_pending_ = false;
@@ -487,7 +573,7 @@ index d36dc6f..fe5588f 100644
  }
  
  void XmaContext::Disable() {
-@@ -239,6 +528,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -239,6 +603,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
      return;
    }
  
@@ -498,7 +584,7 @@ index d36dc6f..fe5588f 100644
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
  
-@@ -332,6 +625,28 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+@@ -332,6 +700,28 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
    output_rb.set_write_offset(output_write_offset);
    remaining_subframe_blocks_in_output_buffer_ =
        static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
@@ -527,7 +613,7 @@ index d36dc6f..fe5588f 100644
  
    return output_rb;
  }
-@@ -445,16 +760,21 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -445,16 +835,26 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const int8_t raw_frame_read_offset =
@@ -536,8 +622,14 @@ index d36dc6f..fe5588f 100644
 +      current_frame_total_subframes_ - current_frame_remaining_subframes_;
  
 -  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
-+  output_rb->Write(out_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
-                    subframes_to_write * kOutputBytesPerBlock);
+-                   subframes_to_write * kOutputBytesPerBlock);
++  if (clip_muted_) {
++    static const std::array<uint8_t, kOutputBytesPerBlock * 16> kSilence{};
++    output_rb->Write(kSilence.data(), subframes_to_write * kOutputBytesPerBlock);
++  } else {
++    output_rb->Write(out_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
++                     subframes_to_write * kOutputBytesPerBlock);
++  }
 +  if (REXCVAR_GET(xma_dump)) {
 +    DumpWrite(id(), data->sample_rate, data->is_stereo,
 +              out_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
@@ -552,7 +644,7 @@ index d36dc6f..fe5588f 100644
    remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write + headroom;
    current_frame_remaining_subframes_ -= subframes_to_write;
  }
-@@ -596,6 +916,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -596,6 +996,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (packet_info.current_frame_size_ == 0) {
      const uint8_t* next_packet = GetNextPacket(data, next_packet_index, current_input_packet_count);
      if (!next_packet) {
@@ -568,7 +660,7 @@ index d36dc6f..fe5588f 100644
        SwapInputBuffer(data);
        return;
      }
-@@ -614,6 +943,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -614,6 +1023,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
    }
  
@@ -585,7 +677,7 @@ index d36dc6f..fe5588f 100644
    BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
    stream.SetOffset(data->input_buffer_read_offset);
  
-@@ -631,6 +970,18 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -631,6 +1050,18 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
        const uint8_t* next_packet =
            GetNextPacket(data, next_packet_index, current_input_packet_count);
        if (!next_packet) {
@@ -604,7 +696,7 @@ index d36dc6f..fe5588f 100644
          data->error_status = 4;
          return;
        }
-@@ -656,23 +1007,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -656,23 +1087,133 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (DecodePacket(av_context_, av_packet_, av_frame_)) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   raw_frame_.data());
