@@ -139,7 +139,7 @@ index 46719f3..45e3be2 100644
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
          driver->frames_unused_.push(buffer);
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index d36dc6f..c7620cd 100644
+index d36dc6f..9230b3e 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -15,6 +15,14 @@
@@ -173,7 +173,7 @@ index d36dc6f..c7620cd 100644
 +                    "Log XMA context setup (buffers, loop registers) when it changes, and loop-end "
 +                    "positions the decoder steps over without looping (diagnostics only)");
 +
-+REXCVAR_DEFINE_BOOL(xma_honor_stream_skip, true, "Audio",
++REXCVAR_DEFINE_BOOL(xma_honor_stream_skip, false, "Audio",
 +                    "Drop the encoder-delay / end-padding samples marked in XMA frame headers "
 +                    "(start/end skip), as the console's XMA hardware does. Fixes the click at "
 +                    "every pass of buffer-resubmitted loops (e.g. OutRun's engine sounds).");
@@ -186,7 +186,7 @@ index d36dc6f..c7620cd 100644
 +REXCVAR_DEFINE_INT32(xma_start_latency_us, 6000, "Audio",
 +                     "Hold a freshly cleared (restarted) context's first decode for this many "
 +                     "microseconds, like real hardware decode latency (an XAudio2 voice that is started and then turned down otherwise plays its first mixer pass loud: OutRun engine pops). 0 = decode on kick.");
-+REXCVAR_DEFINE_INT32(xma_declick, 128, "Audio",
++REXCVAR_DEFINE_INT32(xma_declick, 0, "Audio",
 +                     "At every splice the decoder makes (a stream starting or restarting, or a "
 +                     "re-submitted loop wrapping) ramp from the previously output sample into the "
 +                     "new audio over this many samples, removing the step that clicks. 0 = off");
@@ -213,7 +213,7 @@ index d36dc6f..c7620cd 100644
 +                    "XAudio leaves the read offset stale, so this made the next kick decode "
 +                    "nothing and the voice starved (dropout click)");
 +
-+REXCVAR_DEFINE_BOOL(xma_stall_on_missing_packet, true, "Audio",
++REXCVAR_DEFINE_BOOL(xma_stall_on_missing_packet, false, "Audio",
 +                    "When a frame continues into the next input buffer and the game has not "
 +                    "marked that buffer valid yet, wait for it (as the hardware does) instead of "
 +                    "raising decode error 4 - which made XAudio kill the voice mid-sound");
